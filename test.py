@@ -1,26 +1,32 @@
 import torch
+import json
+import pandas as pd
+import os
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-import datetime
-import json
+from huggingface_hub import login
 
-# 1. Postavke
-base_model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-adapter_path = "./tiny-retail-adapter-v2" # Pazi da je ovo točna putanja novog adaptera
-start_time = datetime.datetime.now()
+login(token=os.getenv("HF_TOKEN"))
 
-print(f"--- Početak testa: {start_time} ---")
+# --- POSTAVKE ---
+base_model_id = "meta-llama/Llama-3.1-8B-Instruct"
+adapters_dir = "./adapters"
+input_csv_file = "shopping_cart_final_normalized.csv" # Tvoj ulazni file
+output_dir = "./results"
 
-# 2. Konfiguracija za RTX 3070 (4-bit učitavanje)
+# Create output directory if it doesn't exist
+os.makedirs(output_dir, exist_ok=True)
+
+# 1. Konfiguracija (4-bit)
 bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
     bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.bfloat16, 
+    bnb_4bit_compute_dtype=torch.bfloat16,
     bnb_4bit_use_double_quant=True,
 )
 
-# 3. Učitavanje Baznog Modela
-print("Učitavam bazni model...")
+# 2. Učitavanje Modela
+print(f"Učitavam model: {base_model_id}...")
 model = AutoModelForCausalLM.from_pretrained(
     base_model_id,
     quantization_config=bnb_config,
@@ -31,92 +37,121 @@ model = AutoModelForCausalLM.from_pretrained(
 tokenizer = AutoTokenizer.from_pretrained(base_model_id)
 tokenizer.pad_token = tokenizer.eos_token
 
-# 4. Spajanje LoRA Adaptera (OVO JE NEDOSTAJALO)
-print(f"Spajam LoRA adapter iz {adapter_path}...")
-model = PeftModel.from_pretrained(model, adapter_path)
-model.eval()
+# 3. Pronalaženje svih "-merged" adaptera
+print(f"Tražim -merged adaptere u '{adapters_dir}'...")
+available_adapters = []
+if os.path.exists(adapters_dir):
+    for folder in os.listdir(adapters_dir):
+        folder_path = os.path.join(adapters_dir, folder)
+        if os.path.isdir(folder_path) and "-merged" in folder:
+            available_adapters.append(folder_path)
+            print(f"  Pronađen adapter: {folder}")
 
-# 5. Funkcija za predikciju (Ažuriran format!)
-def predict_intent(user_input):
-    # BITNO: Format mora biti identičan onom iz treninga (TinyLlama Chat format)
-    prompt = f"""<|system|>
-Analyze the user request and extract action, product, and quantity into JSON format.</s>
-<|user|>
-{user_input}</s>
-<|assistant|>
+if not available_adapters:
+    print(f"GREŠKA: Nema -merged adaptera pronađenih u '{adapters_dir}'!")
+    exit()
+
+print(f"Ukupno pronađeno {len(available_adapters)} -merged adapter(a).")
+
+# 4. Funkcija za predikciju
+def predict_intent(user_input, model):
+    prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+Analyze the user request and extract action, product, and quantity into JSON format.<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+{user_input}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
 """
-    
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     
     with torch.no_grad():
         outputs = model.generate(
             **inputs, 
             max_new_tokens=128, 
-            do_sample=False,   # Greedy decoding za konzistentnost
-            pad_token_id=tokenizer.eos_token_id
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
         )
     
     full_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
     
-    # Parsiranje odgovora (uzimamo sve nakon assistant taga)
+    # Čišćenje outputa (uzimamo samo JSON dio)
     try:
-        response_part = full_output.split("<|assistant|>\n")[-1].strip()
+        response_part = full_output.split("assistant")[-1].strip()
+        if "{" in response_part:
+            start_idx = response_part.find("{")
+            end_idx = response_part.rfind("}") + 1
+            response_part = response_part[start_idx:end_idx]
     except:
-        response_part = full_output # Fallback ako split ne uspije
+        pass 
         
     return response_part
 
-# 6. Prošireni set promptova (10 primjera)
-test_sentences = [
-    # Standardni add/remove
-    "I want to remove 3 apples from my cart.",
-    "Please add 5 bottles of water.",
-    
-    # Slang i neformalni govor
-    "Nix the bananas.",
-    "Can you toss 2 pizza into the basket?",
-    "Grab me a sweater.",  # Implicitna količina (1)
-    
-    # Promjena mišljenja / Negacije
-    "Actually, make that 10 eggs instead.",
-    "Forget about the milk.",
-    "I changed my mind, take out the jeans.",
-    
-    # Malo kompleksniji zahtjevi
-    "Drop 1 blender from the order.",
-    "I need 4 more notebooks please."
-]
+# 5. Učitavanje Datasetsa iz CSV-a
+print(f"Učitavam pitanja iz '{input_csv_file}'...")
+if not os.path.exists(input_csv_file):
+    print("GREŠKA: Input CSV nije pronađen!")
+    exit()
 
-results = []
+# Učitavamo bez headera jer tvoj file nema header (prvi stupac je tekst)
+df_input = pd.read_csv(input_csv_file, header=None)
+# Pretpostavljamo da je tekst pitanja u prvom stupcu (indeks 0)
+test_sentences = df_input[0].tolist()
 
-print("\n--- Rezultati Testiranja ---\n")
-for sentence in test_sentences:
-    result = predict_intent(sentence)
+print(f"Ukupno pronađeno {len(test_sentences)} primjera.\n")
+
+# --- TESTIRANJE ZA SVAKI ADAPTER ---
+for adapter_path in available_adapters:
+    adapter_name = os.path.basename(adapter_path)
+    output_csv_file = os.path.join(output_dir, f"test_results_{adapter_name}.csv")
     
-    # Validacija JSON-a (samo vizualno za log)
+    print(f"\n{'='*60}")
+    print(f"Pokrećem testiranje za adapter: {adapter_name}")
+    print(f"{'='*60}\n")
+    
+    # Učitavamo adapter
+    print(f"Spajam adapter: {adapter_path}...")
     try:
-        json.loads(result)
-        valid_json = "✅ Valid JSON"
-    except:
-        valid_json = "❌ Invalid JSON"
-
-    print(f"Input:  {sentence}")
-    print(f"Output: {result}")
-    print(f"Status: {valid_json}")
-    print("-" * 30)
-    results.append((sentence, result))
-
-# Spremanje rezultata
-end_time = datetime.datetime.now()
-duration = end_time - start_time
-print(f"Ukupno trajanje: {duration}")
-
-with open("test_results.txt", "w", encoding="utf-8") as file:
-    file.write(f"Test run: {start_time}\n")
-    file.write(f"Model: {adapter_path}\n")
-    file.write("=" * 40 + "\n\n")
-    for sentence, result in results:
-        file.write(f"User Input: {sentence}\n")
-        file.write(f"Model Output: {result}\n")
-        file.write("-" * 30 + "\n")
-    file.write(f"\nTotal duration: {duration}")
+        current_model = PeftModel.from_pretrained(model, adapter_path)
+        current_model.eval()
+    except Exception as e:
+        print(f"GREŠKA pri učitavanju {adapter_path}: {e}")
+        continue
+    
+    # Lista za spremanje rezultata
+    data_for_csv = []
+    
+    print("Pokrećem Testiranje...\n")
+    
+    for i, sentence in enumerate(test_sentences):
+        # Ispis napretka svakih 50 primjera da znaš da radi
+        if (i + 1) % 50 == 0:
+            print(f"Obrađujem {i+1}/{len(test_sentences)}...")
+    
+        raw_response = predict_intent(sentence, current_model)
+        
+        # Pokušaj parsiranja JSON-a da ga razbijemo u stupce
+        action = ""
+        product = ""
+        quantity = ""
+        
+        try:
+            parsed = json.loads(raw_response)
+            action = parsed.get("action", "")
+            product = parsed.get("product", "")
+            quantity = parsed.get("quantity", "")
+        except json.JSONDecodeError:
+            # Ako je JSON neispravan, ostavljamo prazno ili upisujemo error
+            action = "ERROR"
+            
+        # Dodavanje u listu za CSV (samo traženi stupci)
+        data_for_csv.append({
+            "User Input": sentence,
+            "llm_action": action,
+            "llm_product": product,
+            "llm_quantity": quantity,
+        })
+    
+    # Spremanje u CSV pomoću pandasa
+    df = pd.DataFrame(data_for_csv)
+    df.to_csv(output_csv_file, index=False, encoding='utf-8')
+    
+    print(f"\nGotovo! Rezultati za '{adapter_name}' spremljeni u '{output_csv_file}'\n")
